@@ -1,0 +1,21 @@
+# сборка devkitPro
+build/
+*.elf
+*.nro
+*.nacp
+*.nso
+*.pfs0
+*.lst
+*.map
+dist/
+
+# тесты на ПК
+tests/sim
+tests/sim.exe
+tests/previewbin
+tests/previewbin.exe
+tests/sdroot/
+tests/shots/
+
+.DS_Store
+__MACOSX/
