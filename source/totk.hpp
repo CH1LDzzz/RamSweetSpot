@@ -46,12 +46,20 @@ std::vector<TotkRun> newRunsSince(const BenchSnapshot& before, std::string* late
 bool lastRun(TotkRun* out, std::string* file);
 // Новые отчёты о падениях Atmosphère с момента снимка.
 std::vector<std::string> newCrashReports(const BenchSnapshot& before);
+// Имена файлов отчётов о падениях (crash_reports, fatal_reports) — без пути, по возрастанию.
+std::vector<std::string> crashReportNames();
 
 // maxlastbreath.ini мода UltraCam: где лежит и какой бенчмарк выбран (4 = Korok Forest).
 std::string findUltraCamIni();
 int readBenchmarkIndex(const std::string& iniPath);
 bool writeBenchmarkIndex(const std::string& iniPath, int index);
 const char* benchmarkName(int index);
+
+// Подпись в файле бенчмарка перед запуском игры: разделитель и кто сейчас прогоняется. Прогоны ниже подписи —
+// этого кандидата; файл удобно читать глазами. Пишется в те файлы, что уже есть (иначе — TOTKBench.txt).
+void appendBenchMarker(const std::string& title, const std::string& detail);
+// Строка-итог после разбора прогонов («засчитано …»).
+void appendBenchNote(const std::string& line);
 
 // Запуск TOTK. false + текст ошибки, если система не дала.
 bool launchTotk(std::string* err);

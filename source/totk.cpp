@@ -122,6 +122,34 @@ std::vector<std::string> benchFileCandidates() {
     return {sdRoot() + "TOTKBench.txt", sdRoot() + "TOTKBenchmark.txt"};
 }
 
+static std::vector<std::string> benchFilesForMarks() {
+    std::vector<std::string> out;
+    for (auto& p : benchFileCandidates())
+        if (fileExists(p)) out.push_back(p);
+    if (out.empty()) out.push_back(sdRoot() + "TOTKBench.txt");
+    return out;
+}
+
+static void appendText(const std::string& path, const std::string& text) {
+    std::string old;
+    readFile(path, old);
+    // Мод мог оставить файл без перевода строки в конце — тогда подпись прилипла бы к его строке.
+    std::string pre = (!old.empty() && old.back() != '\n') ? "\n" : "";
+    writeFile(path, old + pre + text);
+}
+
+void appendBenchMarker(const std::string& title, const std::string& detail) {
+    const std::string line(72, '-');
+    std::string t = "\n" + line + "\n" + title + "\n";
+    if (!detail.empty()) t += detail + "\n";
+    t += line + "\n";
+    for (auto& p : benchFilesForMarks()) appendText(p, t);
+}
+
+void appendBenchNote(const std::string& line) {
+    for (auto& p : benchFilesForMarks()) appendText(p, line + "\n");
+}
+
 static std::vector<std::string> crashDirs() {
     // erpt_reports не берём: туда пишутся и обычные системные события, не только падения.
     return {sdRoot() + "atmosphere/crash_reports", sdRoot() + "atmosphere/fatal_reports"};
@@ -249,6 +277,16 @@ bool lastRun(TotkRun* out, std::string* file) {
         found = true;
     }
     return found;
+}
+
+std::vector<std::string> crashReportNames() {
+    std::vector<std::string> out;
+    for (auto& f : listCrashFiles()) {
+        size_t p = f.rfind('/');
+        out.push_back(p == std::string::npos ? f : f.substr(p + 1));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 std::vector<std::string> newCrashReports(const BenchSnapshot& before) {

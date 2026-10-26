@@ -10,6 +10,7 @@
 namespace {
 Service g_srv;
 bool g_open = false;
+u32 g_cfgCount = 0;
 std::mutex g_ipc;  // интерфейс и рабочий поток ходят в демон одновременно
 
 // Ошибка IPC — в журнал. Одинаковые подряд пишем не чаще раза в 30 с (контекст опрашивается каждую секунду).
@@ -32,7 +33,10 @@ enum Cmd : u32 {
     Cmd_GetProfiles = 5,
     Cmd_SetProfiles = 6,
     Cmd_SetOverride = 8,
+    Cmd_GetConfigValues = 9,
+    Cmd_SetConfigValues = 10,
     Cmd_GetFreqList = 11,
+    Cmd_SetKipData = 12,
 };
 
 struct SetOverrideArgs {
@@ -202,6 +206,45 @@ bool setProfiles(u64 tid, const u32 mhz[25]) {
     return R_SUCCEEDED(rc);
 }
 
+bool getConfig(std::vector<u64>* values) {
+    std::lock_guard<std::mutex> lk(g_ipc);
+    if (!g_open) return false;
+    // Метка в каждой ячейке: где она осталась — туда демон не писал (список короче нашего).
+    const u64 kUnset = 0xA5A5A5A55A5A5A5AULL;
+    values->assign(kConfigCount, kUnset);
+    Result rc = serviceDispatch(&g_srv, Cmd_GetConfigValues, .buffer_attrs = {SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out},
+                                .buffers = {{values->data(), values->size() * sizeof(u64)}}, );
+    if (R_FAILED(rc)) {
+        logRc("GetConfigValues", rc);
+        return false;
+    }
+    u32 n = kConfigCount;
+    while (n > 0 && (*values)[n - 1] == kUnset) (*values)[--n] = 0;
+    if (n != g_cfgCount) LOGI("Демон отдал %u настроек из %u", n, kConfigCount);
+    g_cfgCount = n;
+    return true;
+}
+
+u32 configCount() { return g_cfgCount; }
+
+bool setConfig(const std::vector<u64>& values) {
+    std::lock_guard<std::mutex> lk(g_ipc);
+    if (!g_open || values.size() != kConfigCount) return false;
+    Result rc = serviceDispatch(&g_srv, Cmd_SetConfigValues, .buffer_attrs = {SfBufferAttr_HipcAutoSelect | SfBufferAttr_In},
+                                .buffers = {{values.data(), values.size() * sizeof(u64)}}, );
+    if (R_FAILED(rc)) logRc("SetConfigValues", rc);
+    return R_SUCCEEDED(rc);
+}
+
+bool setKipData() {
+    std::lock_guard<std::mutex> lk(g_ipc);
+    if (!g_open) return false;
+    const u32 request = 0;
+    Result rc = serviceDispatchIn(&g_srv, Cmd_SetKipData, request);
+    if (R_FAILED(rc)) logRc("SetKipData", rc);
+    return R_SUCCEEDED(rc);
+}
+
 }  // namespace rclk
 
 #else  // ПК: демона нет
@@ -217,6 +260,10 @@ bool freqList(u32, std::vector<u32>*) { return false; }
 bool setOverride(u32, u32) { return false; }
 bool getProfiles(u64, u32*) { return false; }
 bool setProfiles(u64, const u32*) { return false; }
+bool getConfig(std::vector<u64>*) { return false; }
+u32 configCount() { return 0; }
+bool setConfig(const std::vector<u64>&) { return false; }
+bool setKipData() { return false; }
 }  // namespace rclk
 
 #endif

@@ -2,7 +2,7 @@
 CXX ?= c++
 CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter -pthread
 SRC := ../source/util.cpp ../source/log.cpp ../source/knobs.cpp ../source/dram.cpp ../source/membench.cpp \
-       ../source/totk.cpp ../source/tuner.cpp sim.cpp
+       ../source/totk.cpp ../source/tuner.cpp ../source/history.cpp ../source/archive.cpp sim.cpp
 SDROOT ?= ./sdroot
 
 sim: $(SRC) $(wildcard ../source/*.hpp)

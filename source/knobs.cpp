@@ -126,6 +126,17 @@ bool knobSetFromString(const std::string& str, KnobSet& out) {
     return true;
 }
 
+std::string knobSetCompact(const KnobSet& s) {
+    KnobSet c;
+    for (auto& kv : s) {
+        const KnobDef* d = findKnob(kv.first);
+        if (d && d->absentIsZero && kv.second == 0) continue;  // сток — на экране только шум
+        c.insert(kv);
+    }
+    if (c.empty() && !s.empty()) return "сток Ryazha-clk";
+    return knobSetShort(c);
+}
+
 std::string knobSetShort(const KnobSet& s) {
     if (s.empty()) return "общие (из кипа)";
     std::string out;

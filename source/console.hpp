@@ -37,6 +37,16 @@ public:
     bool saveText(const std::string& path, const std::string& text) override;
     bool loadText(const std::string& path, std::string& text) override;
     void idle(u32 ms) override;
+    bool kipRead(std::map<int, int>* slots, std::string* err) override;
+    bool kipWrite(const std::map<int, int>& slots, std::string* err) override;
+    bool reboot(std::string* err) override;
+    u64 uptimeMs() override;
+    std::string sensors() override;
+    int watchdogState() override;
+    bool safeMode() override;
+    bool kipCommonRead(KnobSet* vals, std::string* err) override;
+    bool kipCommonWrite(const KnobSet& vals, std::string* err) override;
+    bool kipCommonMax(const std::string& key, int* max) override;
 
     // Частоты ЦПУ/ГПУ, которые держит приложение через временные значения Ryazha-clk:
     //   Free   — ничего не фиксируем;
@@ -51,6 +61,7 @@ public:
     // Ближайшая доступная у демона частота не выше заданной (МГц). 0 — модуль не трогаем.
     u32 pickHz(u32 module, int mhz, std::string* note);
     bool setGameClocks(std::string* note) override;
+    void freeClocks() override { setClockMode(ClockMode::Free); }
     bool gameClocksActive() override;
 
     // Для ручного режима: только частота / только тайминги.

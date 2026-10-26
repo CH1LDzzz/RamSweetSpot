@@ -337,3 +337,185 @@ bool ConsoleTarget::saveText(const std::string& path, const std::string& text) {
 bool ConsoleTarget::loadText(const std::string& path, std::string& text) { return readFileSafe(path, text); }
 
 void ConsoleTarget::idle(u32 ms) { sleepMs(ms); }
+
+// ============================================================== кип
+
+static const u64 kCustRev = 35;  // ревизия таблицы кипа Ryazha-clk 3.6.0 и 3.5.5 (CUST_REV; кип у них один)
+
+static bool readKipConfig(std::vector<u64>* v, std::string* err) {
+    if (!rclk::getConfig(v)) {
+        if (err) *err = "демон не отдал настройки (GetConfigValues)";
+        return false;
+    }
+    if ((*v)[rclk::kCfgCustRev] != kCustRev) {
+        if (err) *err = strf("ревизия таблицы кипа %llu, приложение знает только %llu (Ryazha-clk 3.5.5 / 3.6.0)", (unsigned long long)(*v)[rclk::kCfgCustRev],
+                             (unsigned long long)kCustRev);
+        return false;
+    }
+    return true;
+}
+
+bool ConsoleTarget::kipRead(std::map<int, int>* slots, std::string* err) {
+    std::vector<u64> v;
+    if (!readKipConfig(&v, err)) return false;
+    slots->clear();
+    // Знаковые: отрицательное лежит дополнительным кодом в младших 32 битах.
+    for (int i = 0; i < 28; i++) (*slots)[i] = (int)(s32)(u32)v[rclk::kCfgTmehFirst + i];
+    return true;
+}
+
+bool ConsoleTarget::kipWrite(const std::map<int, int>& slots, std::string* err) {
+    std::vector<u64> v;
+    if (!readKipConfig(&v, err)) return false;
+    std::string what;
+    for (auto& kv : slots) {
+        if (kv.first < 0 || kv.first >= 28) continue;
+        u64& cell = v[rclk::kCfgTmehFirst + kv.first];
+        u64 nv = (u64)(u32)(s32)kv.second;
+        if (cell != nv) what += strf(" t%d:%d→%d", kv.first, (int)(s32)(u32)cell, kv.second);
+        cell = nv;
+    }
+    LOGI("Кип: запись ручек пропускной способности:%s", what.empty() ? " без изменений" : what.c_str());
+    if (!rclk::setConfig(v)) {
+        if (err) *err = "демон не принял настройки (SetConfigValues)";
+        return false;
+    }
+    if (!rclk::setKipData()) {
+        if (err) *err = "демон не записал кип (SetKipData)";
+        return false;
+    }
+    sleepMs(500);
+    std::map<int, int> back;
+    if (!kipRead(&back, err)) return false;
+    for (auto& kv : slots) {
+        if (back[kv.first] != kv.second) {
+            if (err) *err = strf("после записи слот %d = %d вместо %d (демон отбросил значение вне диапазона?)", kv.first, back[kv.first], kv.second);
+            LOGE("Кип: %s", err ? err->c_str() : "");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ConsoleTarget::reboot(std::string* err) {
+#ifdef __SWITCH__
+    // Только через систему: psc сообщает демону о выключении, сторож гасится и возвращает настройки в кип.
+    // Перезагрузку мимо HOS (bpcRebootSystem) сторож не отличит от зависания и загрузит консоль в стоке с откатом.
+    setClockMode(ClockMode::Free);
+    LOGI("Кип: перезагрузка консоли через spsm");
+    Result rc = spsmInitialize();
+    if (R_SUCCEEDED(rc)) {
+        rc = spsmShutdown(true);
+        spsmExit();
+    }
+    if (R_SUCCEEDED(rc)) {
+        // Система приняла запрос: перезагрузка идёт сама, процесс просто доживает последние секунды.
+        // Раньше здесь ошибочно сообщалось «не удалась» с кодом 0.
+        LOGI("Кип: система приняла перезагрузку — ждём");
+        for (int i = 0; i < 600; i++) sleepMs(100);
+        if (err) *err = "система приняла перезагрузку, но за 60 с консоль не перезагрузилась";
+        LOGE("Кип: %s", err ? err->c_str() : "");
+        return false;
+    }
+    if (err) *err = strf("spsmShutdown: 0x%X", rc);
+    LOGE("Кип: перезагрузка не удалась: 0x%X", rc);
+    return false;
+#else
+    if (err) *err = "не консоль";
+    return false;
+#endif
+}
+
+// Общие тайминги кипа в списке настроек демона (pMEH / sMEH, как в оверлее «Общие · нужна перезагрузка»).
+// max — что демон принимает (ryazhaclkValidConfigValue в Ryazha-clk 3.6.0: pMEH[8..10] ≤ 4/4/8, sMEH[14,15] ≤ 3,
+// sMEH[18..20] = 0); выше — сбрасывает в 0. tRTW, tWTR и tREFI через кип не задаются.
+static const struct {
+    const char* key;
+    u32 idx;
+    int max;
+} kCommon[] = {{"tRCD", 237, 4}, {"tRP", 238, 4}, {"tRAS", 239, 8}, {"tRRD", 267, 3},
+               {"tRFC", 268, 3}, {"tRTW", 271, 0}, {"tWTR", 272, 0}, {"tREFI", 273, 0}};
+
+bool ConsoleTarget::kipCommonMax(const std::string& key, int* max) {
+    for (auto& c : kCommon)
+        if (key == c.key) {
+            *max = c.max;
+            return true;
+        }
+    return false;
+}
+
+bool ConsoleTarget::kipCommonRead(KnobSet* vals, std::string* err) {
+    std::vector<u64> v;
+    if (!readKipConfig(&v, err)) return false;
+    vals->clear();
+    for (auto& c : kCommon) (*vals)[c.key] = (int)(s32)(u32)v[c.idx];
+    return true;
+}
+
+bool ConsoleTarget::kipCommonWrite(const KnobSet& vals, std::string* err) {
+    std::vector<u64> v;
+    if (!readKipConfig(&v, err)) return false;
+    std::string what;
+    for (auto& c : kCommon) {
+        auto it = vals.find(c.key);
+        if (it == vals.end()) continue;
+        if (v[c.idx] != (u64)(u32)it->second) what += strf(" %s:%d→%d", c.key, (int)v[c.idx], it->second);
+        v[c.idx] = (u64)(u32)it->second;
+    }
+    LOGI("Кип: общие тайминги:%s", what.empty() ? " без изменений" : what.c_str());
+    if (!rclk::setConfig(v)) {
+        if (err) *err = "демон не принял настройки (SetConfigValues)";
+        return false;
+    }
+    if (!rclk::setKipData()) {
+        if (err) *err = "демон не записал кип (SetKipData)";
+        return false;
+    }
+    sleepMs(500);
+    KnobSet back;
+    if (!kipCommonRead(&back, err)) return false;
+    for (auto& kv : vals)
+        if (back.count(kv.first) && back[kv.first] != kv.second) {
+            if (err) *err = strf("после записи %s = %d вместо %d", kv.first.c_str(), back[kv.first], kv.second);
+            return false;
+        }
+    return true;
+}
+
+bool ConsoleTarget::safeMode() {
+    // Метка сеанса сторожа (Ryazha-clk 3.6.0, pwr/watchdog.cpp): {u32 magic "RWDS", u8 safe, 3 байта, u64 время}.
+    // Пишется при взводе таймера; safe = 1 — эта загрузка после зависания, частоты демон не ставит.
+    std::string b;
+    if (!readFile(paths::rclkDir() + "watchdog/session.bin", b) || b.size() < 5) return false;
+    u32 magic = (u8)b[0] | ((u8)b[1] << 8) | ((u8)b[2] << 16) | ((u32)(u8)b[3] << 24);
+    return magic == 0x53445752u && b[4] != 0;
+}
+
+int ConsoleTarget::watchdogState() {
+    std::vector<u64> v;
+    if (!rclk::getConfig(&v) || v.size() <= rclk::kCfgWatchdog) return -1;
+    if (rclk::configCount() <= rclk::kCfgWatchdog) {
+        LOGI("Сторожа у Ryazha-clk нет (настроек %u — до 3.6.0)", rclk::configCount());
+        return kWatchdogNone;
+    }
+    int on = v[rclk::kCfgWatchdog] != 0 ? 1 : 0;
+    LOGI("Сторож Ryazha-clk: %s", on ? "включён" : "выключен");
+    return on;
+}
+
+std::string ConsoleTarget::sensors() {
+    RclkContext c;
+    if (!rclk::context(&c)) return "датчики: демон не ответил";
+    return strf("SoC %d °C, MEM %d °C, VDD2 %d мВ, VDDQ %d мВ, SoC %d мВ, РАМ %s, ЦПУ %s, ГПУ %s МГц, %d мВт", c.temps[0] / 1000, c.temps[7] / 1000,
+                voltMv(c.voltages[1]), voltMv(c.voltages[4]), voltMv(c.voltages[0]), mhzStr(c.realFreqs[RclkModule_MEM]).c_str(),
+                mhzStr(c.realFreqs[RclkModule_CPU]).c_str(), mhzStr(c.realFreqs[RclkModule_GPU]).c_str(), c.power[0]);
+}
+
+u64 ConsoleTarget::uptimeMs() {
+#ifdef __SWITCH__
+    return armTicksToNs(armGetSystemTick()) / 1000000ULL;
+#else
+    return nowMs();
+#endif
+}

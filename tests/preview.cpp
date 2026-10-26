@@ -59,7 +59,13 @@ int main(int argc, char** argv) {
     std::string root = argc > 1 ? argv[1] : "./sdroot";
     std::string out = argc > 2 ? argv[2] : "./shots";
     setSdRoot(root);
-    if (!gfx::initHost("/Library/Fonts/Arial Unicode.ttf") && !gfx::initHost("/System/Library/Fonts/Supplemental/Arial.ttf")) {
+    // Третий аргумент — свой шрифт: широкий (Verdana) ближе к системному шрифту консоли, наложения видны сразу.
+    if (argc > 3 && !gfx::initHost(argv[3])) {
+        printf("шрифт %s не открылся\n", argv[3]);
+        return 1;
+    }
+    if (argc <= 3 && !gfx::initHost("/Library/Fonts/Arial Unicode.ttf") && !gfx::initHost("/System/Library/Fonts/Supplemental/Arial.ttf") &&
+        !gfx::initHost("C:/Windows/Fonts/arial.ttf")) {
         printf("нет шрифта\n");
         return 1;
     }
@@ -74,6 +80,13 @@ int AppPreview::run(App& a, const std::string& root, const std::string& out) {
 
     a.m_warned = false;
     AppPreview::shot(a, path("0_warning.ppm").c_str());
+    // Безопасный режим сторожа — окно сразу при входе, поверх предупреждения.
+    a.m_safe = true;
+    a.offerSafeReboot(0);
+    AppPreview::shot(a, path("0a_warning_safe.ppm").c_str());
+    a.m_dlg.open = false;
+    a.m_safe = false;
+    a.m_toastUntil = 0;
     a.m_warned = true;
 
     a.m_screen = S_Auto;
@@ -81,6 +94,22 @@ int AppPreview::run(App& a, const std::string& root, const std::string& out) {
 
     AppPreview::load(a, root + "/preview_timing.txt");
     AppPreview::shot(a, path("2_auto_timing.ppm").c_str());
+    // Идёт автоподбор: значок справа в строке датчиков не должен ложиться поверх них.
+    a.m_running = true;
+    a.m_jobAuto = true;
+    AppPreview::shot(a, path("2a_auto_busy.ppm").c_str());
+    // Безопасный режим сторожа: отсчёт перезагрузки.
+    a.m_running = false;
+    a.m_safe = true;
+    a.m_safeRebootAt = nowMs() + 7000;
+    AppPreview::shot(a, path("2b_auto_safe.ppm").c_str());
+    a.m_safe = false;
+    a.m_safeRebootAt = 0;
+    // Длинное название этапа в левой панели.
+    Phase keep = a.m_tu.phase;
+    a.m_tu.phase = Phase::Optimize;
+    AppPreview::shot(a, path("2c_auto_optimize.ppm").c_str());
+    a.m_tu.phase = keep;
 
     AppPreview::load(a, root + "/preview_game.txt");
     a.m_tu.gamePendingCand = -1;
@@ -94,9 +123,64 @@ int AppPreview::run(App& a, const std::string& root, const std::string& out) {
     }
     a.m_screen = S_Totk;
     AppPreview::shot(a, path("3_totk.ppm").c_str());
+    a.totkActions(1);
+    AppPreview::shot(a, path("3a_totk_actions.ppm").c_str());
+    a.m_pick.open = false;
+    a.writeFinal(1);
+    AppPreview::shot(a, path("3b_totk_final.ppm").c_str());
+    a.m_dlg.open = false;
+
+    // Свитспот: та же оценка на частоте ниже — кадров больше, потока чуть меньше; рекомендация остаётся своей.
+    if (a.m_tu.cands.size() > 1 && a.m_tu.cands[1].b.valid) {
+        auto keepCands = a.m_tu.cands;
+        Candidate s = a.m_tu.cands[1];
+        s.id = (int)a.m_tu.cands.size();
+        s.hz = 2828800000u;
+        s.crashes = s.attempts = 0;
+        s.b.readMBs *= 0.996;
+        s.b.writeMBs *= 0.996;
+        s.b.copyMBs *= 0.996;
+        for (auto& r : s.runs) r.frames += 6;
+        while (a.m_tu.gameRunsDone(s) < a.cfg().totkRuns) s.runs.push_back(s.runs.empty() ? TotkRun{"Korok Forest", 2772, 27.7, 25, 23} : s.runs[0]);
+        if (a.m_tu.gameRunsDone(a.m_tu.cands[1]) < a.cfg().totkRuns) a.m_tu.cands[1].runs = s.runs;
+        for (auto& r : a.m_tu.cands[1].runs) r.frames = s.runs[0].frames - 6;
+        a.m_tu.cands[1].game = s.game = 1;
+        a.m_tu.cands.push_back(s);
+        a.m_tu.computeRanking();
+        a.m_screen = S_Totk;
+        a.m_sel[S_Totk] = (int)a.m_tu.cands.size() - 1;
+        AppPreview::shot(a, path("3c_totk_sweet.ppm").c_str());
+        a.m_screen = S_Results;
+        AppPreview::shot(a, path("4b_results_sweet.ppm").c_str());
+        // Свитспот ниже рекомендации: кадров чуть меньше, а потока почти столько же — та же выгода на частоте ниже.
+        for (auto& r : a.m_tu.cands.back().runs) r.frames -= 8;
+        a.m_tu.computeRanking();
+        a.m_screen = S_Totk;
+        AppPreview::shot(a, path("3d_totk_sweet_other.ppm").c_str());
+        a.m_screen = S_Results;
+        AppPreview::shot(a, path("4c_results_sweet_other.ppm").c_str());
+        // Архив: две частоты — свитспот помечается в списке.
+        removeFile(archivePath());
+        a.archiveSaveCand(1);
+        a.archiveSaveCand((int)a.m_tu.cands.size() - 1);
+        a.m_toastUntil = 0;
+        a.archiveMenu();
+        AppPreview::shot(a, path("7c_archive_sweet.ppm").c_str());
+        a.m_pick.open = false;
+        removeFile(archivePath());
+        a.m_tu.cands = keepCands;
+        a.m_tu.computeRanking();
+        a.m_sel[S_Totk] = 0;
+    }
 
     a.m_screen = S_Results;
     AppPreview::shot(a, path("4_results.ppm").c_str());
+    // За всё время — история из прогона ./sim.
+    a.m_resAll = true;
+    a.loadHistory();
+    a.m_histSel = (int)a.m_hist.size() / 2;
+    AppPreview::shot(a, path("4a_results_history.ppm").c_str());
+    a.m_resAll = false;
 
     a.m_screen = S_Manual;
     a.m_manSet = {{"tRCD", 4}, {"tRP", 3}, {"RL", -1}, {"ramPD", 1}};
@@ -121,6 +205,20 @@ int AppPreview::run(App& a, const std::string& root, const std::string& out) {
                    "[gen] тайминги применены живьём: таблиц 41 из 41; 2934.4 MHz; 812 мкс; emc_cfg 0000F00D (сон памяти вкл)",
                    "[hw] 2934.4 MHz: регистров арбитра сверено 21, совпало 21 — всё дошло"};
     AppPreview::shot(a, path("7_service.ppm").c_str());
+    // Архив конфигураций: два кандидата сохранены, открыт список и действия с записью.
+    removeFile(archivePath());
+    if (a.m_tu.cands.size() > 2) {
+        a.archiveSaveCand(1);
+        a.archiveSaveCand(2);
+    }
+    a.m_toastUntil = 0;
+    a.archiveMenu();
+    AppPreview::shot(a, path("7a_archive.ppm").c_str());
+    a.m_pick.open = false;
+    a.archiveEntryActions(0);
+    AppPreview::shot(a, path("7b_archive_entry.ppm").c_str());
+    a.m_pick.open = false;
+    removeFile(archivePath());
 
     a.m_screen = S_Auto;
     a.toast("Прошлая проба не завершилась (зависание/перезагрузка) — отмечена как сбой. A — продолжить подбор.", gfx::col::warn);

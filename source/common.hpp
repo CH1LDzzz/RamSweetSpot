@@ -21,7 +21,15 @@ typedef int64_t s64;
 #endif
 
 #define APP_NAME "RamSweetSpot"
-#define APP_VER "1.3.0"
+#define APP_VER "2.0.0"
+// Сборка под публичную Ряженку (Ryazha-clk 3.5.5, без сторожа) — make PUBLIC=1; иначе — под Ryazha-clk 3.6.0.
+#ifdef RAMSS_PUBLIC
+#define RCLK_TARGET "Ryazha-clk 3.5.5"
+#define APP_BUILD " · Ряженка 8.1.0"
+#else
+#define RCLK_TARGET "Ryazha-clk 3.6.0"
+#define APP_BUILD ""
+#endif
 
 // Корень SD-карты. На консоли — "sdmc:/", в тестах на ПК — временная папка.
 const std::string& sdRoot();
@@ -33,6 +41,10 @@ std::string appDir();          // config/ram-sweetspot/
 std::string state();           // журнал автоподбора
 std::string settings();        // настройки
 std::string timingsBackup();   // копия timings.ini до начала работы
+std::string kipBackup();       // ручки пропускной способности кипа до переноса (слот:значение)
+std::string unstable();        // реестр нестабильных значений (не стирается новым подбором)
+std::string kipCommonBackup(); // общие тайминги кипа до «кип сначала»
+std::string researchDir();     // исследование потока: research.cfg / .csv / .pending / .txt
 std::string report();          // текстовый отчёт
 std::string rclkDir();         // config/ryazha-clk/
 std::string timings();         // config/ryazha-clk/timings.ini
@@ -50,6 +62,11 @@ inline u32 hzToKhz(u32 hz) { return (hz + 500) / 1000; }
 std::string trim(const std::string& s);
 std::vector<std::string> split(const std::string& s, char sep);
 bool startsWith(const std::string& s, const char* prefix);
+// INI в стиле Atmosphere (system_settings.ini: «[секция]», «ключ = значение», комментарии «;» и «#»).
+// iniGet — значение ключа в секции (нет — пусто). iniSet — поставить ключ: строка ключа заменяется, нет — дописывается
+// в конец секции, нет секции — в конец файла; всё остальное, включая переводы строк, остаётся как было.
+std::string iniGet(const std::string& text, const std::string& section, const std::string& key);
+std::string iniSet(const std::string& text, const std::string& section, const std::string& key, const std::string& value);
 long toLong(const std::string& s, long def, bool* ok = nullptr);
 double toDouble(const std::string& s, double def, bool* ok = nullptr);
 
@@ -66,5 +83,6 @@ void makeDirs(const std::string& dir);
 std::vector<std::string> listDir(const std::string& dir);
 
 u64 nowMs();
+std::string timeStamp();  // «2026-10-24 21:40:05» по местному времени
 s64 epochNow();
 void sleepMs(u32 ms);

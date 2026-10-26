@@ -12,10 +12,16 @@ include $(DEVKITPRO)/libnx/switch_rules
 
 APP_TITLE   := RamSweetSpot
 APP_AUTHOR  := RamSweetSpot
-APP_VERSION := 1.3.0
+APP_VERSION := 2.0.0
 
 TARGET   := RamSweetSpot
+# make PUBLIC=1 — сборка под публичную Ряженку (Ryazha-clk 3.5.5), в отдельной папке сборки.
+ifeq ($(PUBLIC),1)
+BUILD    := build_public
+DEFINES  += -DRAMSS_PUBLIC
+else
 BUILD    := build
+endif
 SOURCES  := source
 DATA     := data
 INCLUDES := source third_party

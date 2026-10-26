@@ -1,5 +1,7 @@
 #include "membench.hpp"
 
+#include "log.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -78,6 +80,42 @@ void runParallel(int n, const std::function<void(int)>& fn) {
     for (auto& t : th) t.join();
 #endif
 }
+
+// Время, которое текущий поток реально провёл на ядре, в тиках системного таймера (0 — неизвестно).
+static u64 threadTicks() {
+#ifdef __SWITCH__
+    u64 v = 0;
+    if (R_SUCCEEDED(svcGetInfo(&v, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, (u64)-1))) return v;
+#endif
+    return 0;
+}
+
+// Счёт времени потока совпадает с системным таймером? Проверяется один раз на 5 мс занятого цикла: если нет
+// (другие единицы, ошибка вызова, ПК) — вытеснение не отслеживаем, а не перемеряем всё подряд.
+static bool threadTicksUsable() {
+    static int ok = -1;
+    if (ok >= 0) return ok == 1;
+    u64 a = threadTicks(), t0 = ticksNow();
+    while (ticksToSec(ticksNow() - t0) < 0.005) {
+    }
+    u64 b = threadTicks(), t1 = ticksNow();
+    double share = t1 > t0 && b > a ? (double)(b - a) / (double)(t1 - t0) : 0;
+    ok = share > 0.9 && share < 1.1 ? 1 : 0;
+    return ok == 1;
+}
+
+// Доля окна замера, которую поток провёл на ядре; меньше 0,9 — его вытесняли, проход недостоверен.
+struct CoreShare {
+    u64 tt0 = 0, w0 = 0;
+    void start() {
+        tt0 = threadTicks();
+        w0 = ticksNow();
+    }
+    double stop() const {
+        u64 tt1 = threadTicks(), w1 = ticksNow();
+        return w1 > w0 && tt1 >= tt0 ? (double)(tt1 - tt0) / (double)(w1 - w0) : 1.0;
+    }
+};
 
 // Простой «стартовый барьер» на атомике: все потоки начинают замер одновременно.
 // Если какой-то поток не создался и работа идёт последовательно, ждём не дольше 100 мс.
@@ -197,6 +235,11 @@ static void kernelWrite(u8* p, size_t bytes, u64 pattern) {
 
 static volatile u64 g_sink;
 
+// БАРЬЕР КОМПИЛЯТОРА. Без него GCC 16 (devkitA64) выбрасывал замер чтения целиком: шесть проходов одного и того же
+// чистого чтения, сложенные XOR, гасят друг друга — цикл между двумя чтениями таймера исчезал, и «чтение» выходило
+// 30 923 764 531 МБ/с. Барьер говорит компилятору: память и указатель могли измениться — каждый проход выполни заново.
+static inline void clobber(const void* p) { asm volatile("" : : "r"(p) : "memory"); }
+
 // ------------------------------------------------------------------ MemBench
 
 bool MemBench::init(size_t bwBytesTotal, size_t latBytes) {
@@ -241,66 +284,121 @@ void MemBench::shutdown() {
     m_bwBytes = m_latBytes = 0;
 }
 
-double MemBench::measureRead() {
+// Без наложения адресов (как alloc_four_nonaliased_buffers в TinyMemBenchNX): регионы потоков и половины копии
+// сдвинуты на разные «узоры», кратные 128 Б. Иначе у одновременных потоков и у источника с приёмником копии совпадали
+// младшие биты адреса — одни и те же наборы L1 (2-way) и L2, 4К-алиасинг, банки, — и копия шумела сильнее всего.
+static const size_t kSlack = 1 << 20;                     // запас региона под сдвиги
+static const size_t kSrcSkew = 0xAAA80, kDstSkew = 0x55500;  // 0xAAAAA и 0x55555 по 128 Б
+static size_t threadSkew(int i) { return ((size_t)i * 0x15580) & ~(size_t)127; }
+
+u8* MemBench::region(int i, size_t* len) const {
     size_t per = m_bwBytes / m_threads;
+    *len = (per - kSlack) & ~(size_t)127;
+    return m_bw + per * i + threadSkew(i);
+}
+
+void MemBench::notePreempt(const std::vector<double>& share) {
+    if (!threadTicksUsable()) return;
+    for (double s : share)
+        if (s < 0.9) m_preempted = true;
+}
+
+double MemBench::measureRead() {
     const int reps = 8;
     std::vector<u64> t0(m_threads), t1(m_threads);
+    std::vector<double> share(m_threads, 1.0);
     SpinBarrier bar(m_threads);
     runParallel(m_threads, [&](int i) {
-        const u8* p = m_bw + per * i;
-        u64 s = kernelRead(p, per);  // прогрев TLB
+        size_t len = 0;
+        const u8* p = region(i, &len);
+        u64 s = kernelRead(p, len);  // прогрев TLB
         bar.wait();
+        CoreShare cs;
+        cs.start();
         t0[i] = ticksNow();
-        for (int r = 0; r < reps; r++) s ^= kernelRead(p, per);
+        for (int r = 0; r < reps; r++) {
+            clobber(p);
+            s += kernelRead(p, len);
+        }
         t1[i] = ticksNow();
+        share[i] = cs.stop();
         g_sink = s;
     });
+    notePreempt(share);
+    size_t len = 0;
+    region(0, &len);
     u64 a = *std::min_element(t0.begin(), t0.end()), b = *std::max_element(t1.begin(), t1.end());
     double sec = ticksToSec(b - a);
-    return sec > 0 ? (double)per * m_threads * reps / sec / 1e6 : 0;
+    return sec > 0 ? (double)len * m_threads * reps / sec / 1e6 : 0;
 }
 
 double MemBench::measureWrite() {
-    size_t per = m_bwBytes / m_threads;
-    const int reps = 6;
+    const int reps = 8;  // было 6: запись быстрая, а окно — короткое
     std::vector<u64> t0(m_threads), t1(m_threads);
+    std::vector<double> share(m_threads, 1.0);
     SpinBarrier bar(m_threads);
     runParallel(m_threads, [&](int i) {
-        u8* p = m_bw + per * i;
+        size_t len = 0;
+        u8* p = region(i, &len);
         bar.wait();
+        CoreShare cs;
+        cs.start();
         t0[i] = ticksNow();
-        for (int r = 0; r < reps; r++) kernelWrite(p, per, 0x0123456789ABCDEFULL + r);
+        for (int r = 0; r < reps; r++) {
+            kernelWrite(p, len, 0x0123456789ABCDEFULL + r);
+            clobber(p);
+        }
         t1[i] = ticksNow();
+        share[i] = cs.stop();
     });
+    notePreempt(share);
+    size_t len = 0;
+    region(0, &len);
     u64 a = *std::min_element(t0.begin(), t0.end()), b = *std::max_element(t1.begin(), t1.end());
     double sec = ticksToSec(b - a);
-    return sec > 0 ? (double)per * m_threads * reps / sec / 1e6 : 0;
+    return sec > 0 ? (double)len * m_threads * reps / sec / 1e6 : 0;
 }
 
 double MemBench::measureCopy() {
-    size_t per = m_bwBytes / m_threads;
-    size_t half = per / 2;
-    const int reps = 6;
+    const int reps = 12;  // было 6: копия давала половину шума оценки за 13 % времени прохода
     std::vector<u64> t0(m_threads), t1(m_threads);
+    std::vector<double> share(m_threads, 1.0);
     SpinBarrier bar(m_threads);
+    size_t len = 0;
+    region(0, &len);
+    size_t half = (len / 2) & ~(size_t)4095, n = half - kSlack;  // байт за копию: источник и приёмник со своими сдвигами
     runParallel(m_threads, [&](int i) {
-        u8* p = m_bw + per * i;
+        size_t l = 0;
+        u8* p = region(i, &l);
+        u8* src = p + kSrcSkew;
+        u8* dst = p + half + kDstSkew;
         bar.wait();
+        CoreShare cs;
+        cs.start();
         t0[i] = ticksNow();
-        for (int r = 0; r < reps; r++) memcpy(p + half, p, half);
+        for (int r = 0; r < reps; r++) {
+            clobber(src);
+            memcpy(dst, src, n);
+            clobber(dst);
+        }
         t1[i] = ticksNow();
+        share[i] = cs.stop();
     });
+    notePreempt(share);
     u64 a = *std::min_element(t0.begin(), t0.end()), b = *std::max_element(t1.begin(), t1.end());
     double sec = ticksToSec(b - a);
     // Копирование: считаем прочитанное + записанное, как MicroMemBench.
-    return sec > 0 ? (double)half * 2 * m_threads * reps / sec / 1e6 : 0;
+    return sec > 0 ? (double)n * 2 * m_threads * reps / sec / 1e6 : 0;
 }
 
 double MemBench::measureLatency(bool dual) {
-    const size_t hops = 1500000;
+    // 0,5 млн переходов вместо 1,5 млн: задержка занимала ~38 % прохода, а в шум оценки давала около 3 %.
+    const size_t hops = 500000;
     u8* p = m_lat;
     // Прогрев.
     for (size_t i = 0; i < 20000; i++) p = *(u8**)p;
+    CoreShare cs;
+    cs.start();
     if (!dual) {
         u64 t0 = ticksNow();
         for (size_t i = 0; i < hops; i += 4) {
@@ -311,6 +409,7 @@ double MemBench::measureLatency(bool dual) {
         }
         u64 t1 = ticksNow();
         g_sink = (u64)(uintptr_t)p;
+        notePreempt({cs.stop()});
         return ticksToSec(t1 - t0) * 1e9 / (double)hops;
     }
     // Две независимые цепочки: вторая стартует с середины цикла.
@@ -325,36 +424,83 @@ double MemBench::measureLatency(bool dual) {
     }
     u64 t1 = ticksNow();
     g_sink = (u64)(uintptr_t)p ^ (u64)(uintptr_t)q;
+    notePreempt({cs.stop()});
     return ticksToSec(t1 - t0) * 1e9 / (double)(hops * 2);
 }
 
-BenchResult MemBench::run(int passes, const std::atomic<bool>* abort) {
+// Усечённое среднее: по k значений с каждого края отброшены, остальные усреднены.
+static double trimmedMean(std::vector<double> v, size_t k) {
+    std::sort(v.begin(), v.end());
+    double s = 0;
+    for (size_t i = k; i < v.size() - k; i++) s += v[i];
+    return s / (double)(v.size() - 2 * k);
+}
+
+BenchResult aggregatePasses(const std::vector<BenchPass>& ps) {
     BenchResult best;
-    if (!m_bw || !m_lat) return best;
-    if (passes < 1) passes = 1;
-    for (int p = 0; p < passes; p++) {
-        if (abort && abort->load()) return BenchResult();
-        double r = measureRead();
-        double w = measureWrite();
-        double c = measureCopy();
-        double l = measureLatency(false);
-        double l2 = measureLatency(true);
-        if (!best.valid) {
-            best.valid = true;
-            best.readMBs = r;
-            best.writeMBs = w;
-            best.copyMBs = c;
-            best.latNs = l;
-            best.lat2Ns = l2;
-        } else {
-            best.readMBs = std::max(best.readMBs, r);
-            best.writeMBs = std::max(best.writeMBs, w);
-            best.copyMBs = std::max(best.copyMBs, c);
-            best.latNs = std::min(best.latNs, l);
-            best.lat2Ns = std::min(best.lat2Ns, l2);
+    if (ps.empty()) return best;
+    best.valid = true;
+    best.passes = ps;
+    if (ps.size() >= 3) {
+        size_t k = std::max<size_t>(1, ps.size() / 5);
+        std::vector<double> rs, ws, cs, ls, l2s;
+        for (auto& p : ps) {
+            rs.push_back(p.r);
+            ws.push_back(p.w);
+            cs.push_back(p.c);
+            ls.push_back(p.l);
+            l2s.push_back(p.l2);
         }
+        best.readMBs = trimmedMean(rs, k);
+        best.writeMBs = trimmedMean(ws, k);
+        best.copyMBs = trimmedMean(cs, k);
+        best.latNs = trimmedMean(ls, k);
+        best.lat2Ns = trimmedMean(l2s, k);
+        return best;
+    }
+    // 1–2 прохода: лучший (чужая нагрузка портит среднее, не лучшее).
+    best.readMBs = best.writeMBs = best.copyMBs = 0;
+    best.latNs = best.lat2Ns = 1e18;
+    for (auto& p : ps) {
+        best.readMBs = std::max(best.readMBs, p.r);
+        best.writeMBs = std::max(best.writeMBs, p.w);
+        best.copyMBs = std::max(best.copyMBs, p.c);
+        best.latNs = std::min(best.latNs, p.l);
+        best.lat2Ns = std::min(best.lat2Ns, p.l2);
     }
     return best;
+}
+
+BenchResult MemBench::run(int passes, const std::atomic<bool>* abort) {
+    if (!m_bw || !m_lat) return BenchResult();
+    if (passes < 1) passes = 1;
+    std::vector<BenchPass> ps;
+    std::vector<std::string> lines;  // в журнал — одной записью после замера: открыть файл на карте — это 30–80 мс
+    int redo = 0;
+    for (int p = 0; p < passes; p++) {
+        if (abort && abort->load()) return BenchResult();
+        m_preempted = false;
+        BenchPass q;
+        q.r = measureRead();
+        q.w = measureWrite();
+        q.c = measureCopy();
+        q.l = measureLatency(false);
+        // Две цепочки задержки в оценку не идут — только в журнал и на экран: меряются в первом проходе.
+        q.l2 = p == 0 || ps.empty() ? measureLatency(true) : ps.front().l2;
+        if (m_preempted && redo < passes / 3 + 1) {
+            // Поток сняли с ядра посреди фазы (системная задача, уведомление) — проход не в счёт, повтор.
+            redo++;
+            lines.push_back(strf("    замер %d/%d: поток вытесняли — повтор (чтение %.0f, запись %.0f, копия %.0f МБ/с)", p + 1, passes, q.r, q.w, q.c));
+            p--;
+            continue;
+        }
+        if (passes > 1)
+            lines.push_back(strf("    замер %d/%d: чтение %.0f, запись %.0f, копия %.0f МБ/с (поток %.0f), задержка %.1f / %.1f нс", p + 1, passes, q.r, q.w,
+                                 q.c, std::cbrt(q.r * q.w * q.c), q.l, q.l2));
+        ps.push_back(q);
+    }
+    logx::testBlock(lines);
+    return aggregatePasses(ps);
 }
 
 // ------------------------------------------------------------------ MemTest
@@ -396,6 +542,10 @@ struct ThreadErr {
     const char* pattern = "";
 };
 
+// Проверочное чтение — только через volatile и после барьера: иначе компилятор вправе «помнить», что сам только что
+// записал, и сравнивать значение с самим собой — ошибки памяти тогда не ловились бы никогда.
+inline u64 rd(const u64* w, size_t i) { return ((const volatile u64*)w)[i]; }
+
 inline void checkWord(ThreadErr& e, const u64* base, size_t i, u64 expect, u64 got, const u8* buf0, const char* pat) {
     if (expect != got) {
         e.errors++;
@@ -436,35 +586,41 @@ MemTestResult MemTest::run(int seconds, const std::atomic<bool>* abort) {
             switch (pass % 5) {
                 case 0: {  // случайные данные
                     for (size_t i = 0; i < n; i++) w[i] = splitmix(seed + i);
-                    for (size_t i = 0; i < n; i++) checkWord(e, w, i, splitmix(seed + i), w[i], m_buf, "случайные");
+                    clobber(w);
+                    for (size_t i = 0; i < n; i++) checkWord(e, w, i, splitmix(seed + i), rd(w, i), m_buf, "случайные");
                     e.bytes += per * 2;
                     break;
                 }
                 case 1: {  // бегущая инверсия
                     const u64 P = 0x5555555555555555ULL ^ (seed & 0xFF00FF00FF00FF00ULL);
                     for (size_t i = 0; i < n; i++) w[i] = P;
+                    clobber(w);
                     for (size_t i = 0; i < n; i++) {
-                        checkWord(e, w, i, P, w[i], m_buf, "инверсия");
+                        checkWord(e, w, i, P, rd(w, i), m_buf, "инверсия");
                         w[i] = ~P;
                     }
+                    clobber(w);
                     for (size_t i = n; i-- > 0;) {
-                        checkWord(e, w, i, ~P, w[i], m_buf, "инверсия");
+                        checkWord(e, w, i, ~P, rd(w, i), m_buf, "инверсия");
                         w[i] = P;
                     }
-                    for (size_t i = 0; i < n; i++) checkWord(e, w, i, P, w[i], m_buf, "инверсия");
+                    clobber(w);
+                    for (size_t i = 0; i < n; i++) checkWord(e, w, i, P, rd(w, i), m_buf, "инверсия");
                     e.bytes += per * 6;
                     break;
                 }
                 case 2: {  // адрес в адресе
                     for (size_t i = 0; i < n; i++) w[i] = (u64)(uintptr_t)(w + i) ^ seed;
-                    for (size_t i = 0; i < n; i++) checkWord(e, w, i, (u64)(uintptr_t)(w + i) ^ seed, w[i], m_buf, "адрес");
+                    clobber(w);
+                    for (size_t i = 0; i < n; i++) checkWord(e, w, i, (u64)(uintptr_t)(w + i) ^ seed, rd(w, i), m_buf, "адрес");
                     e.bytes += per * 2;
                     break;
                 }
                 case 3: {  // бегущий бит на шахматке
                     for (size_t i = 0; i < n; i++) w[i] = ((i & 1) ? ~0ULL : 0ULL) ^ (1ULL << ((i + pass) & 63));
+                    clobber(w);
                     for (size_t i = 0; i < n; i++)
-                        checkWord(e, w, i, ((i & 1) ? ~0ULL : 0ULL) ^ (1ULL << ((i + pass) & 63)), w[i], m_buf, "бегущий бит");
+                        checkWord(e, w, i, ((i & 1) ? ~0ULL : 0ULL) ^ (1ULL << ((i + pass) & 63)), rd(w, i), m_buf, "бегущий бит");
                     e.bytes += per * 2;
                     break;
                 }
@@ -475,7 +631,8 @@ MemTestResult MemTest::run(int seconds, const std::atomic<bool>* abort) {
                         size_t len = std::min(chunk, h - off);
                         memcpy(w + h + off, w + off, len * 8);
                     }
-                    for (size_t i = 0; i < h; i++) checkWord(e, w + h, i, splitmix(seed ^ i), w[h + i], m_buf, "копирование");
+                    clobber(w);
+                    for (size_t i = 0; i < h; i++) checkWord(e, w + h, i, splitmix(seed ^ i), rd(w, h + i), m_buf, "копирование");
                     e.bytes += per * 2;
                     break;
                 }

@@ -42,6 +42,7 @@ std::vector<AutoKnob> autoKnobPlan(bool allowTrefiHigh, bool advanced);
 std::string knobSetToString(const KnobSet& s);          // "tRCD:4,tRP:3" или "-"
 bool knobSetFromString(const std::string& str, KnobSet& out);
 std::string knobSetShort(const KnobSet& s);              // для таблиц: "tRCD4 tRP3 RL-1"
+std::string knobSetCompact(const KnobSet& s);            // для экрана: без ручек пропускной способности на стоке (0)
 
 // timings.ini: разбор и запись с сохранением комментариев и чужих секций.
 class TimingsIni {

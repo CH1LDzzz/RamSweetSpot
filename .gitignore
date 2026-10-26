@@ -19,3 +19,7 @@ tests/shots/
 
 .DS_Store
 __MACOSX/
+build_public/
+tests/sdr*/
+tests/shots_wide/
+tests/simout.txt
