@@ -1,0 +1,4 @@
+* text=auto
+README.txt text eol=crlf
+*.png binary
+*.jpg binary
